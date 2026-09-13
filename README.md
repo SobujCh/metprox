@@ -33,7 +33,7 @@ You can also create those files yourself before running the script.
 
 - Backs up `/etc/network/interfaces.d/50-cloud-init` once as `50-cloud-init_backup` (never overwrites an existing backup)
 - Adds each IP from `ip.txt` and source-routes it
-- Installs 3proxy with one port per IPv4, starting at `30000`
+- Installs 3proxy (from Debian, or [3proxy.org](https://3proxy.org/repo/) if apt has no package) with one port per IPv4, starting at `30000`
 
 Example: first IP uses port `30000`, second uses `30001`, and so on.
 

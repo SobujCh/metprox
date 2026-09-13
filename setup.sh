@@ -55,16 +55,34 @@ read_tty() {
     fi
 }
 
+valid_auth() {
+    local auth="$1"
+    local user="${auth%%:*}"
+    local pass="${auth#*:}"
+    [ -n "$auth" ] && [ "$auth" != "$user" ] && [ -n "$user" ] && [ -n "$pass" ]
+}
+
+valid_ip_line() {
+    local address="$1"
+    local gateway="$2"
+    local extra="${3:-}"
+
+    [ -n "$address" ] || return 1
+    [[ "$address" == \#* ]] && return 0
+    [ -n "$gateway" ] && [ -z "$extra" ] || return 1
+    [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || return 1
+    [[ "$gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    return 0
+}
+
 prompt_auth() {
-    local auth user pass
+    local auth
     echo
     echo "auth.txt not found. Enter proxy credentials as username:password"
     while true; do
-        read_tty -p "Auth: " auth
+        read_tty -p "Auth: " auth || true
         auth="${auth//$'\r'/}"
-        user="${auth%%:*}"
-        pass="${auth#*:}"
-        if [ -z "$auth" ] || [ "$auth" = "$user" ] || [ -z "$user" ] || [ -z "$pass" ]; then
+        if ! valid_auth "$auth"; then
             echo "Invalid format. Example: myuser:S3cretPass"
             continue
         fi
@@ -76,25 +94,51 @@ prompt_auth() {
 }
 
 prompt_ips() {
-    local line count=0
+    local line address gateway extra ok real
+    local -a lines=()
+
     echo
     echo "ip.txt not found. Paste the full IP list, one 'address/prefix gateway' per line."
     echo "Example: 103.174.50.4/24 103.174.50.1"
     echo "Finish with an empty line or Ctrl-D."
-    : > "$IP_FILE"
+
     while true; do
-        read_tty line || break
-        line="${line//$'\r'/}"
-        [ -z "$line" ] && break
-        printf '%s\n' "$line" >> "$IP_FILE"
-        count=$((count + 1))
+        lines=()
+        while true; do
+            read_tty line || break
+            line="${line//$'\r'/}"
+            [ -z "$line" ] && break
+            lines+=("$line")
+        done
+
+        if [ "${#lines[@]}" -eq 0 ]; then
+            echo "No IP lines received. Paste the list again."
+            continue
+        fi
+
+        ok=1
+        real=0
+        for line in "${lines[@]}"; do
+            read -r address gateway extra <<< "$line"
+            if [[ "$address" == \#* ]]; then
+                continue
+            fi
+            if ! valid_ip_line "$address" "${gateway:-}" "${extra:-}"; then
+                echo "Invalid line: $line"
+                echo "Expected: address/prefix gateway"
+                ok=0
+                break
+            fi
+            real=$((real + 1))
+        done
+
+        if [ "$ok" -eq 1 ] && [ "$real" -gt 0 ]; then
+            printf '%s\n' "${lines[@]}" > "$IP_FILE"
+            echo "Saved $real line(s) to $IP_FILE"
+            break
+        fi
+        echo "ip.txt was not created. Paste a valid list."
     done
-    if [ "$count" -eq 0 ]; then
-        rm -f "$IP_FILE"
-        echo "No IP lines received."
-        exit 1
-    fi
-    echo "Saved $count line(s) to $IP_FILE"
 }
 
 if [ ! -f "$AUTH_FILE" ]; then
@@ -142,18 +186,9 @@ while read -r address gateway extra; do
     [ -z "${address:-}" ] && continue
     [[ "$address" == \#* ]] && continue
 
-    if [ -z "${gateway:-}" ] || [ -n "${extra:-}" ]; then
-        echo "Invalid line: $address $gateway ${extra:-}"
-        exit 1
-    fi
-
-    if [[ ! "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-        echo "Invalid IPv4 address: $address"
-        exit 1
-    fi
-
-    if [[ ! "$gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "Invalid gateway: $gateway"
+    if ! valid_ip_line "$address" "${gateway:-}" "${extra:-}"; then
+        echo "Invalid line: $address ${gateway:-} ${extra:-}"
+        echo "Expected: address/prefix gateway"
         exit 1
     fi
 
@@ -179,11 +214,140 @@ if [ ! -f "$NETWORK_FILE" ]; then
 fi
 
 # ============================================================
-# Install packages
+# Install packages and 3proxy
+# Debian Trixie+ no longer ships 3proxy in apt, so fall back
+# to the official 3proxy.org repo, then GitHub .deb, then source.
 # ============================================================
 
+THREEPROXY_VERSION="${THREEPROXY_VERSION:-0.9.8}"
+
+ensure_3proxy_service() {
+    if systemctl cat "$THREEPROXY_SERVICE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local bin=""
+    if command -v 3proxy >/dev/null 2>&1; then
+        bin="$(command -v 3proxy)"
+    elif [ -x /bin/3proxy ]; then
+        bin=/bin/3proxy
+    elif [ -x /usr/bin/3proxy ]; then
+        bin=/usr/bin/3proxy
+    elif [ -x /usr/local/bin/3proxy ]; then
+        bin=/usr/local/bin/3proxy
+    else
+        echo "3proxy binary not found."
+        return 1
+    fi
+
+    cat > /etc/systemd/system/3proxy.service <<EOF
+[Unit]
+Description=3proxy tiny proxy server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$bin $THREEPROXY_CONFIG
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+install_3proxy_from_repo() {
+    mkdir -p /usr/share/keyrings
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL https://3proxy.org/repo/3proxy-release-key.asc -o /usr/share/keyrings/3proxy.asc || return 1
+    else
+        wget -qO /usr/share/keyrings/3proxy.asc https://3proxy.org/repo/3proxy-release-key.asc || return 1
+    fi
+
+    cat > /etc/apt/sources.list.d/3proxy.sources <<'EOF'
+Types: deb
+URIs: https://3proxy.org/repo/deb
+Suites: lts
+Components: main
+Signed-By: /usr/share/keyrings/3proxy.asc
+EOF
+    apt-get update || return 1
+    apt-get install -y 3proxy || return 1
+}
+
+install_3proxy_from_github() {
+    local arch debarch url deb
+    arch="$(dpkg --print-architecture)"
+    case "$arch" in
+        amd64) debarch=x86_64 ;;
+        arm64) debarch=arm64 ;;
+        armhf) debarch=arm ;;
+        *)
+            echo "Unsupported architecture for 3proxy package: $arch"
+            return 1
+            ;;
+    esac
+
+    deb="/tmp/3proxy-${THREEPROXY_VERSION}.${debarch}.deb"
+    url="https://github.com/3proxy/3proxy/releases/download/${THREEPROXY_VERSION}/3proxy-${THREEPROXY_VERSION}.${debarch}.deb"
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$deb" "$url" || return 1
+    else
+        curl -fsSL "$url" -o "$deb" || return 1
+    fi
+    apt-get install -y "$deb" || return 1
+}
+
+install_3proxy_from_source() {
+    local src="/tmp/3proxy-${THREEPROXY_VERSION}"
+    apt-get install -y build-essential || return 1
+    rm -rf "$src"
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO- "https://github.com/3proxy/3proxy/archive/refs/tags/${THREEPROXY_VERSION}.tar.gz" | tar -xz -C /tmp || return 1
+    else
+        curl -fsSL "https://github.com/3proxy/3proxy/archive/refs/tags/${THREEPROXY_VERSION}.tar.gz" | tar -xz -C /tmp || return 1
+    fi
+    (
+        cd "$src"
+        ln -sf Makefile.Linux Makefile
+        make
+        make install
+    ) || return 1
+}
+
+install_3proxy() {
+    if command -v 3proxy >/dev/null 2>&1 || [ -x /bin/3proxy ] || [ -x /usr/bin/3proxy ]; then
+        echo "3proxy already installed."
+        ensure_3proxy_service
+        return 0
+    fi
+
+    echo "Trying Debian package 3proxy..."
+    if apt-get install -y 3proxy; then
+        return 0
+    fi
+
+    echo "3proxy is not in Debian repos; installing from 3proxy.org..."
+    if install_3proxy_from_repo; then
+        return 0
+    fi
+
+    echo "Official repo failed; downloading GitHub release package..."
+    if install_3proxy_from_github; then
+        return 0
+    fi
+
+    echo "Package download failed; building 3proxy from source..."
+    install_3proxy_from_source
+    ensure_3proxy_service
+}
+
 apt-get update
-apt-get install -y 3proxy iproute2 python3
+apt-get install -y iproute2 python3 ca-certificates wget curl
+install_3proxy
+ensure_3proxy_service
 
 # ============================================================
 # Backup current network config once
@@ -308,7 +472,6 @@ fi
 mkdir -p /etc/3proxy
 
 cat > "$THREEPROXY_CONFIG" <<EOF
-daemon
 nserver 1.1.1.1
 nserver 8.8.8.8
 nscache 65536
