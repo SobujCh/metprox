@@ -4,7 +4,12 @@ Add extra IPv4 addresses on a Debian VPS and run a 3proxy instance on each one.
 
 ## Setup
 
+On a blank Debian VPS, copy the scripts (no git needed):
+
 ```bash
+mkdir -p /root/metprox && cd /root/metprox
+wget -q https://raw.githubusercontent.com/SobujCh/metprox/main/setup.sh
+wget -q https://raw.githubusercontent.com/SobujCh/metprox/main/restore.sh
 chmod +x setup.sh restore.sh
 sudo ./setup.sh
 ```
